@@ -22,7 +22,7 @@ class Args(Tap):
     model_name: str = "cl-tohoku/bert-base-japanese-v3"
     dataset_dir: Path = "./datasets/livedoor"
 
-    batch_size: int = 16
+    batch_size: int = 4
     epochs: int = 20
     lr: float = 3e-5
     num_warmup_epochs: int = 2
@@ -34,7 +34,9 @@ class Args(Tap):
     seed: int = 42
 
     def process_args(self):
-        self.label2id: dict[str, int] = utils.load_json(self.dataset_dir / "label2id.json")
+        self.label2id: dict[str, int] = utils.load_json(
+            self.dataset_dir / "label2id.json"
+        )
         self.labels: list[int] = list(self.label2id.values())
 
         date, time = datetime.now().strftime("%Y-%m-%d/%H-%M-%S.%f").split("/")
@@ -76,7 +78,9 @@ class Experiment:
         else:
             self.model = torch.compile(self.model)
 
-        self.train_dataloader: DataLoader = self.load_dataset(split="train", shuffle=True)
+        self.train_dataloader: DataLoader = self.load_dataset(
+            split="train", shuffle=True
+        )
         self.val_dataloader: DataLoader = self.load_dataset(split="val")
         self.test_dataloader: DataLoader = self.load_dataset(split="test")
 
@@ -122,19 +126,25 @@ class Experiment:
             pin_memory=True,
         )
 
-    def create_optimizer(self) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
+    def create_optimizer(
+        self,
+    ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
         # see: https://tma15.github.io/blog/2021/09/17/deep-learningbert%E5%AD%A6%E7%BF%92%E6%99%82%E3%81%ABbias%E3%82%84layer-normalization%E3%82%92weight-decay%E3%81%97%E3%81%AA%E3%81%84%E7%90%86%E7%94%B1/
         no_decay = {"bias", "LayerNorm.weight"}
         optimizer_grouped_parameters = [
             {
                 "params": [
-                    param for name, param in self.model.named_parameters() if not name in no_decay
+                    param
+                    for name, param in self.model.named_parameters()
+                    if not name in no_decay
                 ],
                 "weight_decay": self.args.weight_decay,
             },
             {
                 "params": [
-                    param for name, param in self.model.named_parameters() if name in no_decay
+                    param
+                    for name, param in self.model.named_parameters()
+                    if name in no_decay
                 ],
                 "weight_decay": 0.0,
             },
@@ -150,7 +160,8 @@ class Experiment:
 
         return optimizer, lr_scheduler
 
-    @torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else None)
+    # @torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else None)
+    @torch.cuda.amp.autocast(enabled=True, dtype=torch.float16)
     def run(self):
         val_metrics = {"epoch": None, **self.evaluate(self.val_dataloader)}
         best_epoch, best_val_f1 = None, val_metrics["f1"]
@@ -199,12 +210,15 @@ class Experiment:
         return val_metrics, test_metrics
 
     @torch.no_grad()
-    @torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else None)
+    # @torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else None)
+    @torch.cuda.amp.autocast(enabled=True, dtype=torch.float16)
     def evaluate(self, dataloader: DataLoader) -> dict[str, float]:
         self.model.eval()
         total_loss, gold_labels, pred_labels = 0, [], []
 
-        for batch in tqdm(dataloader, total=len(dataloader), dynamic_ncols=True, leave=False):
+        for batch in tqdm(
+            dataloader, total=len(dataloader), dynamic_ncols=True, leave=False
+        ):
             out: SequenceClassifierOutput = self.model(**batch.to(self.args.device))
 
             batch_size: int = batch.input_ids.size(0)
@@ -256,6 +270,7 @@ def main(args: Args):
 
 
 if __name__ == "__main__":
+    print(f"is_bf16_supported: {torch.cuda.is_bf16_supported()}")
     args = Args().parse_args()
     utils.init(seed=args.seed)
     main(args)
