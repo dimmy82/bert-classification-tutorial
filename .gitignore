@@ -129,6 +129,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.sei_bct_venv
 env/
 venv/
 ENV/
