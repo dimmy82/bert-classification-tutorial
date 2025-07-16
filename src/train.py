@@ -20,13 +20,13 @@ import src.utils as utils
 
 class Args(Tap):
     model_name: str = "cl-tohoku/bert-base-japanese-v3"
-    dataset_dir: Path = "./datasets/livedoor"
+    dataset_dir: Path = "./datasets/edge-vertical_initial-company"
 
     batch_size: int = 4
     epochs: int = 20
     lr: float = 3e-5
     num_warmup_epochs: int = 2
-    max_seq_len: int = 512
+    max_seq_len: int = 1024
     weight_decay: float = 0.01
     gradient_checkpointing: bool = False
 
@@ -96,20 +96,26 @@ class Experiment:
         return self.create_loader(dataset, shuffle=shuffle)
 
     def collate_fn(self, data_list: list[dict]) -> BatchEncoding:
-        title = [d["title"] for d in data_list]
-        body = [d["body"] for d in data_list]
+        texts = [d["text"] for d in data_list]
+        # title = [d["title"] for d in data_list]
+        # body = [d["body"] for d in data_list]
 
         inputs: BatchEncoding = self.tokenizer(
-            title,
-            body,
+            texts,
+            # title,
+            # body,
             padding=True,
-            truncation="only_second",
+            # truncation="only_second",
             return_tensors="pt",
             max_length=args.max_seq_len,
         )
 
-        labels = torch.LongTensor([d["label"] for d in data_list])
-        return BatchEncoding({**inputs, "labels": labels})
+        labels = [d["label"] for d in data_list]
+        # print("======== labels ========")
+        # print(labels)
+        labels_tensor = torch.LongTensor(labels)
+        # print(labels_tensor)
+        return BatchEncoding({**inputs, "labels": labels_tensor})
 
     def create_loader(
         self,
@@ -163,10 +169,15 @@ class Experiment:
     # @torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else None)
     @torch.cuda.amp.autocast(enabled=True, dtype=torch.float16)
     def run(self):
-        val_metrics = {"epoch": None, **self.evaluate(self.val_dataloader)}
+        start_metrics = self.evaluate(self.test_dataloader)
+        self.log(start_metrics)
+        val_metrics = self.evaluate(self.val_dataloader)
         best_epoch, best_val_f1 = None, val_metrics["f1"]
         best_state_dict = self.clone_state_dict()
-        self.log(val_metrics)
+        print("====================== org_model ======================")
+        print(self.model)
+        # print("====================== org_state_dict ======================")
+        # print(best_state_dict)
 
         scaler = torch.cuda.amp.GradScaler()
 
@@ -193,13 +204,17 @@ class Experiment:
 
             self.model.eval()
             val_metrics = {"epoch": epoch, **self.evaluate(self.val_dataloader)}
-            self.log(val_metrics)
 
             # 開発セットでのF値最良時のモデルを保存
             if val_metrics["f1"] > best_val_f1:
-                best_val_f1 = val_metrics["f1"]
                 best_epoch = epoch
+                best_val_f1 = val_metrics["f1"]
                 best_state_dict = self.clone_state_dict()
+                self.log(val_metrics)
+                # print("====================== better_model ======================")
+                # print(self.model)
+                # print("====================== best_state_dict ======================")
+                # print(best_state_dict)
 
         self.model.load_state_dict(best_state_dict)
         self.model.eval().to(args.device, non_blocking=True)
@@ -207,7 +222,7 @@ class Experiment:
         val_metrics = {"best-epoch": best_epoch, **self.evaluate(self.val_dataloader)}
         test_metrics = self.evaluate(self.test_dataloader)
 
-        return val_metrics, test_metrics
+        return start_metrics, val_metrics, test_metrics
 
     @torch.no_grad()
     # @torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else None)
@@ -248,7 +263,7 @@ class Experiment:
     def log(self, metrics: dict) -> None:
         utils.log(metrics, self.args.output_dir / "log.csv")
         tqdm.write(
-            f"epoch: {metrics['epoch']} \t"
+            f"epoch: {metrics.get('epoch', None)} \t"
             f"loss: {metrics['loss']:2.6f}   \t"
             f"accuracy: {metrics['accuracy']:.4f} \t"
             f"precision: {metrics['precision']:.4f} \t"
@@ -262,8 +277,9 @@ class Experiment:
 
 def main(args: Args):
     exp = Experiment(args=args)
-    val_metrics, test_metrics = exp.run()
+    start_metrics, val_metrics, test_metrics = exp.run()
 
+    utils.save_json(start_metrics, args.output_dir / "start-metrics.json")
     utils.save_json(val_metrics, args.output_dir / "val-metrics.json")
     utils.save_json(test_metrics, args.output_dir / "test-metrics.json")
     utils.save_config(args, args.output_dir / "config.json")
