@@ -1,6 +1,10 @@
 from datetime import datetime
 from pathlib import Path
 
+from evaluate2.domain.annotated_data import AnnotatedData, AnnotatedDataSet
+from evaluate2.domain.evaluated_report import EvaluateSummaryType
+from evaluate2.domain.evaluators import MultiLabelEvaluator
+from evaluate2.domain.predicted_result import PredictedResult, PredictedResults
 import torch
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from tap import Tap
@@ -14,13 +18,14 @@ from transformers import (
 from transformers.modeling_outputs import SequenceClassifierOutput
 from transformers.optimization import get_linear_schedule_with_warmup
 from transformers.tokenization_utils import BatchEncoding, PreTrainedTokenizer
+from evaluate2.domain.label import Labels, Label
 
 import src.utils as utils
 
 
 class Args(Tap):
     model_name: str = "cl-tohoku/bert-base-japanese-v3"
-    dataset_dir: Path = "./datasets/edge-vertical_initial-company"
+    dataset_dir: Path = "./datasets/sale-talk-department_generated_company_issue"
 
     batch_size: int = 4
     epochs: int = 20
@@ -38,6 +43,13 @@ class Args(Tap):
             self.dataset_dir / "label2id.json"
         )
         self.labels: list[int] = list(self.label2id.values())
+        self.domain_labels = Labels(
+            list=[Label(id=f"{label}") for label in self.labels]
+        )
+        features_df = utils.load_jsonl(
+            f"{self.dataset_dir}/zero-shot-2025q1/features.jsonl"
+        )
+        self.domain_features_text2id = dict(zip(features_df["text"], features_df["id"]))
 
         date, time = datetime.now().strftime("%Y-%m-%d/%H-%M-%S.%f").split("/")
         self.output_dir = self.make_output_dir(
@@ -95,7 +107,7 @@ class Experiment:
         dataset: list[dict] = utils.load_jsonl(path).to_dict(orient="records")
         return self.create_loader(dataset, shuffle=shuffle)
 
-    def collate_fn(self, data_list: list[dict]) -> BatchEncoding:
+    def collate_fn(self, data_list: list[dict]) -> dict:
         texts = [d["text"] for d in data_list]
         # title = [d["title"] for d in data_list]
         # body = [d["body"] for d in data_list]
@@ -115,7 +127,10 @@ class Experiment:
         # print(labels)
         labels_tensor = torch.LongTensor(labels)
         # print(labels_tensor)
-        return BatchEncoding({**inputs, "labels": labels_tensor})
+        return {
+            "feature_ids": [self.args.domain_features_text2id[text] for text in texts],
+            "batch": BatchEncoding({**inputs, "labels": labels_tensor}),
+        }
 
     def create_loader(
         self,
@@ -169,10 +184,11 @@ class Experiment:
     # @torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else None)
     @torch.cuda.amp.autocast(enabled=True, dtype=torch.float16)
     def run(self):
-        start_metrics = self.evaluate(self.test_dataloader)
+        best_score_key = "recall"
+        start_metrics = self.evaluate2(self.test_dataloader)
         self.log(start_metrics)
-        val_metrics = self.evaluate(self.val_dataloader)
-        best_epoch, best_val_f1 = None, val_metrics["f1"]
+        val_metrics = self.evaluate2(self.val_dataloader)
+        best_epoch, best_score = None, val_metrics[best_score_key]
         best_state_dict = self.clone_state_dict()
         print("====================== org_model ======================")
         print(self.model)
@@ -184,12 +200,13 @@ class Experiment:
         for epoch in trange(args.epochs, dynamic_ncols=True):
             self.model.train()
 
-            for batch in tqdm(
+            for batch_dict in tqdm(
                 self.train_dataloader,
                 total=len(self.train_dataloader),
                 dynamic_ncols=True,
                 leave=False,
             ):
+                batch = batch_dict["batch"]
                 out: SequenceClassifierOutput = self.model(**batch.to(args.device))
                 loss: torch.FloatTensor = out.loss
 
@@ -203,12 +220,12 @@ class Experiment:
                     self.lr_scheduler.step()
 
             self.model.eval()
-            val_metrics = {"epoch": epoch, **self.evaluate(self.val_dataloader)}
+            val_metrics = {"epoch": epoch, **self.evaluate2(self.val_dataloader)}
 
             # 開発セットでのF値最良時のモデルを保存
-            if val_metrics["f1"] > best_val_f1:
+            if val_metrics[best_score_key] > best_score:
                 best_epoch = epoch
-                best_val_f1 = val_metrics["f1"]
+                best_score = val_metrics[best_score_key]
                 best_state_dict = self.clone_state_dict()
                 self.log(val_metrics)
                 # print("====================== better_model ======================")
@@ -219,8 +236,8 @@ class Experiment:
         self.model.load_state_dict(best_state_dict)
         self.model.eval().to(args.device, non_blocking=True)
 
-        val_metrics = {"best-epoch": best_epoch, **self.evaluate(self.val_dataloader)}
-        test_metrics = self.evaluate(self.test_dataloader)
+        val_metrics = {"best-epoch": best_epoch, **self.evaluate2(self.val_dataloader)}
+        test_metrics = self.evaluate2(self.test_dataloader)
 
         return start_metrics, val_metrics, test_metrics
 
@@ -231,9 +248,10 @@ class Experiment:
         self.model.eval()
         total_loss, gold_labels, pred_labels = 0, [], []
 
-        for batch in tqdm(
+        for batch_dict in tqdm(
             dataloader, total=len(dataloader), dynamic_ncols=True, leave=False
         ):
+            batch = batch_dict["batch"]
             out: SequenceClassifierOutput = self.model(**batch.to(self.args.device))
 
             batch_size: int = batch.input_ids.size(0)
@@ -244,6 +262,7 @@ class Experiment:
             gold_labels += batch.labels.tolist()
 
         accuracy: float = accuracy_score(gold_labels, pred_labels)
+        # macro top 1 の評価
         precision, recall, f1, _ = precision_recall_fscore_support(
             gold_labels,
             pred_labels,
@@ -258,6 +277,58 @@ class Experiment:
             "precision": precision,
             "recall": recall,
             "f1": f1,
+        }
+
+    @torch.no_grad()
+    # @torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else None)
+    @torch.cuda.amp.autocast(enabled=True, dtype=torch.float16)
+    def evaluate2(self, dataloader: DataLoader) -> dict[str, float]:
+        self.model.eval()
+        total_loss, feature_ids, true_labels, predicted_labels = 0, [], [], []
+
+        for batch_dict in tqdm(
+            dataloader, total=len(dataloader), dynamic_ncols=True, leave=False
+        ):
+            feature_ids += batch_dict["feature_ids"]
+            batch = batch_dict["batch"]
+            # print(f"***: {feature_ids} == {batch['labels']}")
+            out: SequenceClassifierOutput = self.model(**batch.to(self.args.device))
+
+            batch_size: int = batch.input_ids.size(0)
+            loss = out.loss.item() * batch_size
+            total_loss += loss
+
+            true_labels += batch.labels.tolist()
+            predicted_labels += out.logits.argmax(dim=-1).tolist()
+
+        # feature_idsとtrue_labelsを融合した配列を作りたい
+        annotated_data_set = AnnotatedDataSet(
+            set={
+                AnnotatedData(feature_id=str(feature_id), label_id=str(label_id))
+                for feature_id, label_id in zip(feature_ids, true_labels)
+            }
+        )
+        predicted_results = PredictedResults(
+            list=[
+                PredictedResult(
+                    feature_id=str(feature_id),
+                    label_id=str(label_id),
+                    predicted_similarity=1.0,
+                )
+                for feature_id, label_id in zip(feature_ids, predicted_labels)
+            ]
+        )
+
+        evaluator = MultiLabelEvaluator.load(
+            self.args.domain_labels, annotated_data_set, predicted_results
+        )
+
+        return {
+            "loss": loss / len(dataloader.dataset),
+            "accuracy": evaluator.pr_auc(EvaluateSummaryType.MICRO.value),
+            "precision": evaluator.precision(1, EvaluateSummaryType.MICRO.value),
+            "recall": evaluator.recall(1, EvaluateSummaryType.MICRO.value),
+            "f1": 0.0,
         }
 
     def log(self, metrics: dict) -> None:
