@@ -299,7 +299,17 @@ class Experiment:
             total_loss += loss
 
             true_labels += batch.labels.tolist()
-            predicted_labels += out.logits.argmax(dim=-1).tolist()
+
+            # top 1 の予測
+            # predicted_labels += out.logits.argmax(dim=-1).tolist()
+            # print(f"predicted_labels: {predicted_labels}")
+
+            # top 3 の予測
+            _top_k_values, top_k_indices = torch.topk(out.logits, k=3, dim=-1)
+            predicted_labels += top_k_indices.tolist()
+
+            # print(f"feature_ids: {feature_ids}")
+            # print(f"predicted_labels: {predicted_labels}")
 
         # feature_idsとtrue_labelsを融合した配列を作りたい
         annotated_data_set = AnnotatedDataSet(
@@ -315,9 +325,14 @@ class Experiment:
                     label_id=str(label_id),
                     predicted_similarity=1.0,
                 )
-                for feature_id, label_id in zip(feature_ids, predicted_labels)
+                for feature_id, label_ids in zip(feature_ids, predicted_labels)
+                for label_id in label_ids
             ]
         )
+
+        print(f"feature_ids_count: {feature_ids.__len__()}")
+        print(f"true_labels_count: {true_labels.__len__()}")
+        print(f"predicted_results_count: {predicted_results.list.__len__()}")
 
         evaluator = MultiLabelEvaluator.load(
             self.args.domain_labels, annotated_data_set, predicted_results
