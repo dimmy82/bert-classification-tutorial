@@ -283,6 +283,7 @@ class Experiment:
     # @torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else None)
     @torch.cuda.amp.autocast(enabled=True, dtype=torch.float16)
     def evaluate2(self, dataloader: DataLoader) -> dict[str, float]:
+        topk = 3
         self.model.eval()
         total_loss, feature_ids, true_labels, predicted_labels = 0, [], [], []
 
@@ -305,7 +306,7 @@ class Experiment:
             # print(f"predicted_labels: {predicted_labels}")
 
             # top 3 の予測
-            _top_k_values, top_k_indices = torch.topk(out.logits, k=3, dim=-1)
+            _top_k_values, top_k_indices = torch.topk(out.logits, k=topk, dim=-1)
             predicted_labels += top_k_indices.tolist()
 
             # print(f"feature_ids: {feature_ids}")
@@ -341,8 +342,8 @@ class Experiment:
         return {
             "loss": loss / len(dataloader.dataset),
             "accuracy": evaluator.pr_auc(EvaluateSummaryType.MICRO.value),
-            "precision": evaluator.precision(1, EvaluateSummaryType.MICRO.value),
-            "recall": evaluator.recall(1, EvaluateSummaryType.MICRO.value),
+            "precision": evaluator.precision(topk, EvaluateSummaryType.MICRO.value),
+            "recall": evaluator.recall(topk, EvaluateSummaryType.MICRO.value),
             "f1": 0.0,
         }
 
