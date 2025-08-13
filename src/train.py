@@ -26,8 +26,7 @@ import src.utils as utils
 
 class Args(Tap):
     model_name: str = "cl-tohoku/bert-base-japanese-v3"
-    # dataset_dir: Path = "./datasets/edge-vertical_initial-company"
-    dataset_dir: Path = "./datasets/sale-talk-department_generated_company_issue"
+    dataset_dir: Path = f"./datasets/{os.environ['TARGET']}"
 
     batch_size: int = 4
     epochs: int = 20
@@ -52,6 +51,8 @@ class Args(Tap):
             f"{self.dataset_dir}/zero-shot-2025q1/features.jsonl"
         )
         self.domain_features_text2id = dict(zip(features_df["text"], features_df["id"]))
+
+        self.epochs = int(os.getenv("EPOCHS", self.epochs))
 
         self.topk = int(os.getenv("TOP_K", 0))
         if self.topk <= 0:

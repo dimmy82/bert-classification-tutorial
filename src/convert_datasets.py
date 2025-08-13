@@ -1,3 +1,4 @@
+import os
 from src import utils
 
 
@@ -24,10 +25,9 @@ def convert_annotated_data_jsonl(
 
 
 if __name__ == "__main__":
-    # dataset_path = (
-    #     "/home/ds/bert-classification-tutorial/datasets/edge-vertical_initial-company"
-    # )
-    dataset_path = "/home/ds/bert-classification-tutorial/datasets/sale-talk-department_generated_company_issue"
+    dataset_path = (
+        f"/home/ds/bert-classification-tutorial/datasets/{os.environ['TARGET']}"
+    )
     labels_dict = utils.load_json(f"{dataset_path}/label2id.json")
     features_df = utils.load_jsonl(
         f"{dataset_path}/zero-shot-2025q1/features.jsonl"
