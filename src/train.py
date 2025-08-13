@@ -1,3 +1,4 @@
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,7 @@ import src.utils as utils
 
 class Args(Tap):
     model_name: str = "cl-tohoku/bert-base-japanese-v3"
+    # dataset_dir: Path = "./datasets/edge-vertical_initial-company"
     dataset_dir: Path = "./datasets/sale-talk-department_generated_company_issue"
 
     batch_size: int = 4
@@ -50,6 +52,18 @@ class Args(Tap):
             f"{self.dataset_dir}/zero-shot-2025q1/features.jsonl"
         )
         self.domain_features_text2id = dict(zip(features_df["text"], features_df["id"]))
+
+        self.topk = int(os.getenv("TOP_K", 0))
+        if self.topk <= 0:
+            self.topk = 1
+
+        self.best_score_key = os.getenv("BEST_SCORE_KEY", "")
+        if self.best_score_key.lower() != "precision":
+            self.best_score_key = "recall"
+
+        self.evaluate_summary_type = os.getenv("EVALUATE_SUMMARY_TYPE", "")
+        if self.evaluate_summary_type.lower() != EvaluateSummaryType.MACRO.value:
+            self.evaluate_summary_type = EvaluateSummaryType.MICRO.value
 
         date, time = datetime.now().strftime("%Y-%m-%d/%H-%M-%S.%f").split("/")
         self.output_dir = self.make_output_dir(
@@ -119,7 +133,7 @@ class Experiment:
             padding=True,
             # truncation="only_second",
             return_tensors="pt",
-            max_length=args.max_seq_len,
+            max_length=self.args.max_seq_len,
         )
 
         labels = [d["label"] for d in data_list]
@@ -141,7 +155,7 @@ class Experiment:
         return DataLoader(
             dataset,
             collate_fn=self.collate_fn,
-            batch_size=batch_size or args.batch_size,
+            batch_size=batch_size or self.args.batch_size,
             shuffle=shuffle,
             num_workers=4,
             pin_memory=True,
@@ -175,8 +189,8 @@ class Experiment:
 
         lr_scheduler = get_linear_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=len(self.train_dataloader) * args.num_warmup_epochs,
-            num_training_steps=len(self.train_dataloader) * args.epochs,
+            num_warmup_steps=len(self.train_dataloader) * self.args.num_warmup_epochs,
+            num_training_steps=len(self.train_dataloader) * self.args.epochs,
         )
 
         return optimizer, lr_scheduler
@@ -184,11 +198,10 @@ class Experiment:
     # @torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else None)
     @torch.cuda.amp.autocast(enabled=True, dtype=torch.float16)
     def run(self):
-        best_score_key = "recall"
         start_metrics = self.evaluate2(self.test_dataloader)
         self.log(start_metrics)
         val_metrics = self.evaluate2(self.val_dataloader)
-        best_epoch, best_score = None, val_metrics[best_score_key]
+        best_epoch, best_score = None, val_metrics[self.args.best_score_key]
         best_state_dict = self.clone_state_dict()
         print("====================== org_model ======================")
         print(self.model)
@@ -197,7 +210,7 @@ class Experiment:
 
         scaler = torch.cuda.amp.GradScaler()
 
-        for epoch in trange(args.epochs, dynamic_ncols=True):
+        for epoch in trange(self.args.epochs, dynamic_ncols=True):
             self.model.train()
 
             for batch_dict in tqdm(
@@ -207,7 +220,7 @@ class Experiment:
                 leave=False,
             ):
                 batch = batch_dict["batch"]
-                out: SequenceClassifierOutput = self.model(**batch.to(args.device))
+                out: SequenceClassifierOutput = self.model(**batch.to(self.args.device))
                 loss: torch.FloatTensor = out.loss
 
                 self.optimizer.zero_grad()
@@ -223,9 +236,9 @@ class Experiment:
             val_metrics = {"epoch": epoch, **self.evaluate2(self.val_dataloader)}
 
             # 開発セットでのF値最良時のモデルを保存
-            if val_metrics[best_score_key] > best_score:
+            if val_metrics[self.args.best_score_key] > best_score:
                 best_epoch = epoch
-                best_score = val_metrics[best_score_key]
+                best_score = val_metrics[self.args.best_score_key]
                 best_state_dict = self.clone_state_dict()
                 self.log(val_metrics)
                 # print("====================== better_model ======================")
@@ -234,7 +247,7 @@ class Experiment:
                 # print(best_state_dict)
 
         self.model.load_state_dict(best_state_dict)
-        self.model.eval().to(args.device, non_blocking=True)
+        self.model.eval().to(self.args.device, non_blocking=True)
 
         val_metrics = {"best-epoch": best_epoch, **self.evaluate2(self.val_dataloader)}
         test_metrics = self.evaluate2(self.test_dataloader)
@@ -268,7 +281,7 @@ class Experiment:
             pred_labels,
             average="macro",
             zero_division=0,
-            labels=args.labels,
+            labels=self.args.labels,
         )
 
         return {
@@ -283,7 +296,6 @@ class Experiment:
     # @torch.cuda.amp.autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else None)
     @torch.cuda.amp.autocast(enabled=True, dtype=torch.float16)
     def evaluate2(self, dataloader: DataLoader) -> dict[str, float]:
-        topk = 3
         self.model.eval()
         total_loss, feature_ids, true_labels, predicted_labels = 0, [], [], []
 
@@ -306,7 +318,9 @@ class Experiment:
             # print(f"predicted_labels: {predicted_labels}")
 
             # top 3 の予測
-            _top_k_values, top_k_indices = torch.topk(out.logits, k=topk, dim=-1)
+            _top_k_values, top_k_indices = torch.topk(
+                out.logits, k=self.args.topk, dim=-1
+            )
             predicted_labels += top_k_indices.tolist()
 
             # print(f"feature_ids: {feature_ids}")
@@ -341,9 +355,11 @@ class Experiment:
 
         return {
             "loss": loss / len(dataloader.dataset),
-            "accuracy": evaluator.pr_auc(EvaluateSummaryType.MICRO.value),
-            "precision": evaluator.precision(topk, EvaluateSummaryType.MICRO.value),
-            "recall": evaluator.recall(topk, EvaluateSummaryType.MICRO.value),
+            "accuracy": evaluator.pr_auc(self.args.evaluate_summary_type),
+            "precision": evaluator.precision(
+                self.args.topk, self.args.evaluate_summary_type
+            ),
+            "recall": evaluator.recall(self.args.topk, self.args.evaluate_summary_type),
             "f1": 0.0,
         }
 
